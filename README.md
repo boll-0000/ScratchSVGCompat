@@ -1,0 +1,2 @@
+# ScratchSVGCompat
+SVGファイルをScratchで読み込める互換性のあるSVGに変換します
