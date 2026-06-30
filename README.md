@@ -56,7 +56,6 @@ https://scratch.mit.edu/users/boll-0000/
 
 コメントには、**不具合報告であることを明確に記載**した上で、次のいずれかを添付してください。
 
-* SVGファイル本体
 * SVGファイルへのリンク
 * そのSVGを使用しているScratch作品へのリンク
 
@@ -114,7 +113,6 @@ https://scratch.mit.edu/users/boll-0000/
 
 Please clearly indicate that your comment is a **bug report**, and include one of the following:
 
-* The SVG file itself
 * A link to the SVG file
 * A link to the Scratch project that uses the SVG
 
