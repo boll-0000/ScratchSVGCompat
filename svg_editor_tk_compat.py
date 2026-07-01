@@ -436,33 +436,31 @@ def _resolve_special_style_values(style, parent_style=None):
 
 def _compute_inherited_style(elem, parent_style, css_rules):
     """
-    要素の実効スタイルを計算する:
+    要素の実効スタイルを計算する (SVG2 / CSS Cascade 準拠):
       1. parent_styleのうち「継承されるプロパティ」だけを継承
-         (filterやopacityは継承されない = 子に伝えない)
-      2. CSSルール (specificity昇順で適用 = 詳細度の高いものが後勝ちで上書き)
-      3. style属性 を適用 (CSSルールより常に優先)
-      4. 個別 presentation 属性 (fill="..." 等) は最優先として扱う
-         （厳密にCSS仕様とは異なるが、作者明示指定の意図を尊重し、
-           元コードとも互換を保つ）
+      2. 個別 presentation 属性 (fill="..." 等) は specificity 0 の
+         author 宣言として最初に適用 (CSSルールより弱い)
+      3. CSSルール (specificity昇順で適用 = 詳細度の高いものが後勝ち)
+      4. style属性 (インライン style) は最優先
     """
     # 継承プロパティのみ取り込む
     style = {k: v for k, v in parent_style.items() if k in _INHERITED_PROPS}
     tag_name = get_tag_name(elem)
 
-    # CSS ルール (specificity 昇順済み)
+    # 個別 presentation 属性 (specificity 0 として先に適用)
+    for prop in _PRESENTATION_PROPS:
+        v = elem.get(prop)
+        if v is not None:
+            style[prop] = v
+
+    # CSS ルール (specificity 昇順済み) — presentation 属性より優先
     for rule in css_rules:
         sel, decls = rule[0], rule[1]
         if _selector_matches(elem, sel, tag_name):
             style.update(decls)
 
-    # style属性 (インライン style)
+    # style属性 (インライン style) が最優先
     style.update(_parse_style_string(elem.get('style', '')))
-
-    # 個別 presentation 属性 (最優先扱い)
-    for prop in _PRESENTATION_PROPS:
-        v = elem.get(prop)
-        if v is not None:
-            style[prop] = v
 
     return _resolve_special_style_values(style, parent_style)
 
@@ -472,8 +470,8 @@ def _apply_style_to_elem(elem, style):
     for k, v in style.items():
         if k not in _PRESENTATION_PROPS:
             continue
-        if elem.get(k) is None:
-            elem.set(k, v)
+        # CSS解決値を常に適用（SVG仕様準拠: cascaded value を焼き込む）
+        elem.set(k, v)
 
 def _flatten_styles(root):
     """
@@ -1033,7 +1031,8 @@ def convert_text_to_path_matplotlib(text_elem):
             weight = ra.get('font-weight', 'normal')
             style = ra.get('font-style', 'normal')
             # PureモードでもCSS解決後の最終値（#222など）を確実に使う
-            fill = text_elem.get('fill') or ra.get('fill')
+            # CSS解決後の最終値（ra）を優先する
+            fill = ra.get('fill') or text_elem.get('fill')
             fill_opacity = ra.get('fill-opacity')
             opacity = ra.get('opacity')
             stroke = ra.get('stroke')
