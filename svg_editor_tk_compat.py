@@ -195,6 +195,122 @@ def parse_number_list(value):
     parts = re.split(r'[\s,]+', str(value).strip())
     return [parse_float(p) for p in parts if p]
 
+
+def _svg_viewport_size(root):
+    """SVG ルート要素の描画ビューポート (幅, 高さ) を返す。
+    width/height 属性が px 相当で取れなければ viewBox から算出する。"""
+    try:
+        vb = root.get('viewBox') if root is not None else None
+        vb_w = vb_h = None
+        if vb:
+            parts = re.split(r'[\s,]+', vb.strip())
+            if len(parts) >= 4:
+                vb_w = float(parts[2]); vb_h = float(parts[3])
+        w_raw = root.get('width') if root is not None else None
+        h_raw = root.get('height') if root is not None else None
+        def _px(val):
+            if not val:
+                return None
+            m = _UNIT_RE.match(str(val))
+            if not m: return None
+            unit = m.group(2).lower()
+            if unit == '%':
+                return None
+            return float(m.group(1)) * _UNIT_FACTOR.get(unit, 1.0)
+        w = _px(w_raw) or vb_w or 100.0
+        h = _px(h_raw) or vb_h or 100.0
+        return w, h
+    except Exception:
+        return 100.0, 100.0
+
+
+def _parse_length_percent(value, ref):
+    """長さを解決する。'%' は ref に対する割合として解釈。"""
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    s = str(value).strip()
+    if s.endswith('%'):
+        try:
+            return float(s[:-1]) * ref / 100.0
+        except Exception:
+            return 0.0
+    return parse_float(s)
+
+
+# ==========================================
+# 絵文字判定 (Pure Python モードで matplotlib が扱えない文字を検知)
+# ==========================================
+
+def _is_emoji_char(ch):
+    """絵文字/記号系で、Noto Sans CJK JP などの通常和文フォントで
+    グリフを持たない可能性が高い文字を判定する。"""
+    if not ch:
+        return False
+    cp = ord(ch)
+    # Zero-width joiner, variation selectors are part of emoji sequences.
+    if cp in (0x200D, 0xFE0F, 0xFE0E):
+        return True
+    ranges = (
+        (0x1F300, 0x1FAFF),  # Misc Symbols & Pictographs 〜 Symbols and Pictographs Extended-A
+        (0x2600, 0x27BF),    # Misc Symbols, Dingbats
+        (0x2B00, 0x2BFF),    # Misc Symbols and Arrows
+        (0x2300, 0x23FF),    # Misc Technical (⌛ etc)
+        (0x2700, 0x27BF),    # Dingbats
+        (0x1F000, 0x1F02F),  # Mahjong
+        (0x1F0A0, 0x1F0FF),  # Playing cards
+        (0x1F100, 0x1F1FF),  # Enclosed alphanumeric
+        (0x1F200, 0x1F2FF),  # Enclosed ideographic
+    )
+    for lo, hi in ranges:
+        if lo <= cp <= hi:
+            return True
+    return False
+
+
+def _text_has_emoji(text):
+    if not text:
+        return False
+    return any(_is_emoji_char(c) for c in text)
+
+
+def _text_element_has_emoji(elem):
+    """<text> 要素とその子孫 (tspan/textPath) の全テキストを結合して判定。"""
+    try:
+        for node in elem.iter():
+            for s in (node.text, node.tail):
+                if s and _text_has_emoji(s):
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+_EMOJI_FALLBACK_FONTS = "'Noto Color Emoji','Noto Emoji','Apple Color Emoji','Segoe UI Emoji'"
+
+
+def _augment_emoji_font_family(elem):
+    """text/tspan 系要素の font-family に絵文字フォントのフォールバックを追加。
+    style 属性・font-family 属性の両方を更新する。"""
+    try:
+        for node in elem.iter():
+            fam = node.get('font-family')
+            if fam and 'Emoji' not in fam:
+                node.set('font-family', f"{fam},{_EMOJI_FALLBACK_FONTS}")
+            style = node.get('style')
+            if style and 'font-family' in style and 'Emoji' not in style:
+                def _repl(m):
+                    val = m.group(1).rstrip(';').strip()
+                    if 'Emoji' in val:
+                        return m.group(0)
+                    return f"font-family:{val},{_EMOJI_FALLBACK_FONTS}"
+                node.set('style', re.sub(r'font-family\s*:\s*([^;]+)', _repl, style))
+            elif not fam and not style:
+                node.set('font-family', f"sans-serif,{_EMOJI_FALLBACK_FONTS}")
+    except Exception:
+        pass
+
 def replace_element(parent, old_elem, new_elems):
     idx = list(parent).index(old_elem)
     for offset, new_elem in enumerate(new_elems):
@@ -484,6 +600,18 @@ def _flatten_styles(root):
     def walk(elem, parent_style):
         # SVG では <defs> 内も対象 (gradient等の参照先要素もstyle持つことがあるため)
         style = _compute_inherited_style(elem, parent_style, css_rules)
+
+        # テキスト要素（およびその子孫）において、親から継承された stroke があると
+        # 後工程の matplotlib 変換で文字が二重に太くなる（アウトライン＋線）原因になる。
+        # text 要素自体に明示的な stroke 指定がない場合は、継承された stroke を 'none' で上書きする。
+        tag = get_tag_name(elem)
+        if tag in ('text', 'tspan'):
+            # 要素自身に stroke が定義されていない（属性にもインラインスタイルにもない）場合
+            has_own_stroke = (elem.get('stroke') is not None or 
+                             'stroke' in _parse_style_string(elem.get('style', '')))
+            if not has_own_stroke:
+                style['stroke'] = 'none'
+
         _apply_style_to_elem(elem, style)
         for child in elem:
             walk(child, style)
@@ -527,9 +655,19 @@ def _build_font_properties(requested_family, weight=None, style=None, stretch=No
             families.append(fam)
             seen.add(fam)
 
+    # matplotlib の findfont に weight='bold' を渡すと、環境によっては
+    # Yu Gothic UI Bold / Meiryo Bold のような非常に太い CJK Bold 面が
+    # 選ばれてしまい、Inkscape 版と比べて Pure 版だけ文字が明らかに
+    # 太くなる (ユーザー報告のバグ)。matplotlib は変数フォント / .ttc の
+    # weight 軸を正しく扱えないため、bold 指定は「太すぎる」方向にしか
+    # ブレない。合成ボールドも廃止済みなので、ここでは常に Regular 面を
+    # 要求し、"太すぎる" より "実物どおり (やや細め)" を優先する。
+    _ = _requested_weight_value(weight)  # 互換のため呼び出しは残す
+    findfont_weight = 'normal'
+
     fp = FontProperties(
         family=families,
-        weight=_normalize_weight(weight),
+        weight=findfont_weight,
         style=style or 'normal',
         stretch=stretch or 'normal',
     )
@@ -538,13 +676,14 @@ def _build_font_properties(requested_family, weight=None, style=None, stretch=No
         if resolved and os.path.exists(resolved):
             return FontProperties(
                 fname=resolved,
-                weight=_normalize_weight(weight),
+                weight=findfont_weight,
                 style=style or 'normal',
                 stretch=stretch or 'normal',
             )
     except Exception:
         pass
     return fp
+
 
 def _text_advance_width(text, font_props, font_size):
     """Return advance width instead of ink bounding box width."""
@@ -943,7 +1082,7 @@ def _collect_runs(text_elem, parent_attrs):
 
     return runs, text_attrs
 
-def convert_text_to_path_matplotlib(text_elem):
+def convert_text_to_path_matplotlib_legacy(text_elem):
     if not USE_MATPLOTLIB:
         return None
 
@@ -1212,23 +1351,10 @@ def convert_text_to_path_matplotlib(text_elem):
                 p.set('fill-opacity', L['fill_opacity'])
             if L['opacity'] is not None and 'opacity' not in g_elem.attrib:
                 p.set('opacity', L['opacity'])
-            # 元 <text> に指定されていた stroke (例: .pseudo-bold クラス由来) は
-            # そのまま path に転写する。合成ボールドは廃止 (太くなり過ぎるため)。
-            explicit_stroke = L.get('stroke')
-            if explicit_stroke:
-                p.set('stroke', explicit_stroke)
-                if L.get('stroke_width'):
-                    p.set('stroke-width', str(L['stroke_width']))
-                if L.get('stroke_opacity'):
-                    p.set('stroke-opacity', str(L['stroke_opacity']))
-                if L.get('stroke_linejoin'):
-                    p.set('stroke-linejoin', str(L['stroke_linejoin']))
-                if L.get('stroke_linecap'):
-                    p.set('stroke-linecap', str(L['stroke_linecap']))
-                if L.get('paint_order'):
-                    p.set('paint-order', str(L['paint_order']))
-                else:
-                    p.set('paint-order', 'stroke fill')
+            # テキスト由来のパスに stroke を適用すると、Matplotlib が生成したアウトラインの
+            # 外側にさらに線が引かれ、文字が異常に太くなるバグの原因となる。
+            # 特に Inkscape 版との差異をなくすため、ここでは明示的に stroke="none" を設定する。
+            p.set('stroke', 'none')
 
             g_elem.append(p)
 
@@ -1242,6 +1368,558 @@ def convert_text_to_path_matplotlib(text_elem):
     except Exception as e:
         print(f"[Warn] Text conversion error: {e}")
         return None
+
+
+
+# ==========================================
+# 3c-ext. 高度なテキスト機能 (textPath / rotate / x,y配列 / textLength /
+#         writing-mode / baseline-shift / dx配列) を扱うヘルパー群
+# ==========================================
+
+def _glyph_path_d(ch, x, y, font_size, font_props, rotate_deg=0.0, scale_x=1.0):
+    """
+    1グリフを (x, y) ベースライン起点、rotate_deg 度回転、水平方向 scale_x 倍で
+    配置した SVG path d 文字列を返す。matplotlib TextPath はフォントを Y-up で
+    描画するため、まず (scale_x, -1) で Y を反転してから回転・平行移動する。
+    """
+    safe = _textpath_safe_text(ch)
+    if not safe:
+        return ""
+    try:
+        tp = TextPath((0, 0), safe, size=font_size, prop=font_props)
+    except Exception:
+        return ""
+    # matplotlib Affine2D は post-multiply。scale → rotate → translate の順で
+    # 適用したい (＝グリフを Y 反転後に接線角で回してから配置位置に移動)。
+    tr = Affine2D().scale(scale_x, -1).rotate_deg(rotate_deg).translate(x, y)
+    parts = []
+    for vertices, code in tp.iter_segments():
+        v = tr.transform(vertices.reshape(-1, 2)).flatten()
+        if code == Path.MOVETO:
+            parts.append(f"M {v[0]:.3f},{v[1]:.3f}")
+        elif code == Path.LINETO:
+            parts.append(f"L {v[0]:.3f},{v[1]:.3f}")
+        elif code == Path.CURVE3:
+            parts.append(f"Q {v[0]:.3f},{v[1]:.3f} {v[2]:.3f},{v[3]:.3f}")
+        elif code == Path.CURVE4:
+            parts.append(f"C {v[0]:.3f},{v[1]:.3f} {v[2]:.3f},{v[3]:.3f} {v[4]:.3f},{v[5]:.3f}")
+        elif code == Path.CLOSEPOLY:
+            parts.append("Z")
+    return " ".join(parts)
+
+
+def _find_path_d_by_href(root, href):
+    """defs 等から id=href の要素の d 属性を取得。circle/ellipse/line/rect も対応。"""
+    if not href:
+        return None
+    tid = href.lstrip('#')
+    for elem in root.iter():
+        if elem.get('id') != tid:
+            continue
+        tag = get_tag_name(elem)
+        if tag == 'path':
+            return elem.get('d')
+        if tag == 'circle':
+            return circle_to_path_d(parse_float(elem.get('cx', 0)),
+                                    parse_float(elem.get('cy', 0)),
+                                    parse_float(elem.get('r', 0)))
+        if tag == 'ellipse':
+            return ellipse_to_path_d(parse_float(elem.get('cx', 0)),
+                                     parse_float(elem.get('cy', 0)),
+                                     parse_float(elem.get('rx', 0)),
+                                     parse_float(elem.get('ry', 0)))
+        if tag == 'line':
+            return line_to_path_d(parse_float(elem.get('x1', 0)),
+                                  parse_float(elem.get('y1', 0)),
+                                  parse_float(elem.get('x2', 0)),
+                                  parse_float(elem.get('y2', 0)))
+        if tag == 'rect':
+            return rect_to_path_d(parse_float(elem.get('x', 0)),
+                                  parse_float(elem.get('y', 0)),
+                                  parse_float(elem.get('width', 0)),
+                                  parse_float(elem.get('height', 0)))
+        if tag == 'polyline':
+            return points_to_path_d(elem.get('points', ''), close=False)
+        if tag == 'polygon':
+            return points_to_path_d(elem.get('points', ''), close=True)
+    return None
+
+
+class _PathSampler:
+    """svgpathtools を利用したパス上サンプラー。ilength は重いので簡易実装
+    (等距離サンプルテーブル) で高速化する。"""
+    def __init__(self, d_str):
+        from svgpathtools import parse_path
+        import math
+        self._math = math
+        self.path = parse_path(d_str)
+        try:
+            self.length = self.path.length()
+        except Exception:
+            self.length = 0.0
+        # 事前に 200 点サンプルして (s, t) の LUT を作る
+        self._samples = []
+        N = 400 if self.length > 0 else 1
+        for i in range(N + 1):
+            t = i / N
+            try:
+                p = self.path.point(t)
+                self._samples.append((t, p))
+            except Exception:
+                self._samples.append((t, complex(0, 0)))
+        # 累積弧長
+        self._cum = [0.0]
+        for i in range(1, len(self._samples)):
+            _, p0 = self._samples[i - 1]
+            _, p1 = self._samples[i]
+            self._cum.append(self._cum[-1] + abs(p1 - p0))
+        self.length = self._cum[-1]
+
+    def sample(self, s):
+        """弧長 s の点 (x, y) と接線角度 (度) を返す。範囲外は None。"""
+        if self.length <= 0:
+            return None
+        if s < 0 or s > self.length:
+            return None
+        # 二分探索
+        lo, hi = 0, len(self._cum) - 1
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if self._cum[mid] < s:
+                lo = mid + 1
+            else:
+                hi = mid
+        i = max(1, lo)
+        s0, s1 = self._cum[i - 1], self._cum[i]
+        t0, p0 = self._samples[i - 1]
+        t1, p1 = self._samples[i]
+        if s1 - s0 < 1e-9:
+            frac = 0.0
+        else:
+            frac = (s - s0) / (s1 - s0)
+        p = p0 + (p1 - p0) * frac
+        tan = p1 - p0
+        if abs(tan) < 1e-9:
+            ang = 0.0
+        else:
+            ang = self._math.degrees(self._math.atan2(tan.imag, tan.real))
+        return (p.real, p.imag), ang
+
+
+def _iter_text_content(text_elem, base_attrs, svg_root):
+    """<text> 配下 (tspan / textPath / 直下テキスト / tail) を順序どおりに
+    「セグメント」のリストへ展開する。各セグメントは
+      {kind: 'text'|'textPath', text, attrs, path_href?, start_offset?}
+    """
+    def merged(elem, base):
+        a = dict(base)
+        for k in ('x', 'y', 'dx', 'dy', 'rotate',
+                  'font-size', 'font-family', 'font-weight',
+                  'font-style', 'fill', 'fill-opacity', 'opacity',
+                  'stroke', 'stroke-width', 'stroke-opacity',
+                  'stroke-linejoin', 'stroke-linecap', 'paint-order',
+                  'text-anchor', 'dominant-baseline', 'baseline-shift',
+                  'letter-spacing', 'word-spacing', 'white-space',
+                  'line-height', 'textLength', 'lengthAdjust',
+                  'writing-mode'):
+            v = _get_effective_attr(elem, k)
+            if v is not None:
+                a[k] = v
+        # style 属性内の writing-mode / baseline-shift も拾う
+        sty = _parse_style_string(elem.get('style', ''))
+        for k in ('writing-mode', 'baseline-shift'):
+            if k in sty and k not in elem.attrib:
+                a[k] = sty[k]
+        for k in (f"{{{XML_NS}}}space", 'xml:space'):
+            v = elem.get(k)
+            if v is not None:
+                a[k] = v
+        return a
+
+    text_attrs = merged(text_elem, base_attrs)
+    segments = []
+
+    root_ex = ('x' in text_elem.attrib, 'y' in text_elem.attrib)
+    if text_elem.text:
+        segments.append({'kind': 'text', 'text': text_elem.text,
+                         'attrs': text_attrs, 'explicit_xy': root_ex})
+
+    for child in text_elem:
+        tag = get_tag_name(child)
+        child_attrs = merged(child, text_attrs)
+        if tag == 'tspan':
+            if child.text:
+                segments.append({'kind': 'text', 'text': child.text,
+                                 'attrs': child_attrs,
+                                 'explicit_xy': ('x' in child.attrib, 'y' in child.attrib)})
+        elif tag == 'textPath':
+            href = (child.get('href')
+                    or child.get(f"{{{XLINK_NS}}}href")
+                    or child.get('xlink:href'))
+            path_d = _find_path_d_by_href(svg_root, href) if href else None
+            # textPath 内のテキスト (先頭のテキスト + tspan 群) を平坦化
+            tp_text = child.text or ''
+            for sub in child:
+                if get_tag_name(sub) == 'tspan':
+                    tp_text += (sub.text or '')
+                if sub.tail:
+                    tp_text += sub.tail
+            segments.append({
+                'kind': 'textPath',
+                'text': tp_text,
+                'attrs': child_attrs,
+                'path_d': path_d,
+                'start_offset': child.get('startOffset', '0'),
+                'explicit_xy': (False, False),
+            })
+        if child.tail:
+            segments.append({'kind': 'text', 'text': child.tail,
+                             'attrs': text_attrs, 'explicit_xy': (False, False)})
+
+    return segments, text_attrs
+
+
+def _baseline_shift_dy(shift, font_size):
+    if not shift:
+        return 0.0
+    s = str(shift).strip().lower()
+    if s == 'sub':
+        return font_size * 0.30    # 下方向 (画面座標系: +Y)
+    if s == 'super':
+        return -font_size * 0.45   # 上方向
+    if s.endswith('%'):
+        try:
+            return -font_size * float(s[:-1]) / 100.0
+        except Exception:
+            return 0.0
+    try:
+        return -parse_float(shift, 0.0)
+    except Exception:
+        return 0.0
+
+
+def _startoffset_length(value, path_length):
+    if value is None:
+        return 0.0
+    s = str(value).strip()
+    if not s:
+        return 0.0
+    if s.endswith('%'):
+        try:
+            return path_length * float(s[:-1]) / 100.0
+        except Exception:
+            return 0.0
+    return parse_float(s, 0.0)
+
+
+def _is_vertical_wm(wm):
+    if not wm:
+        return False
+    s = str(wm).strip().lower()
+    return s.startswith('tb') or s.startswith('vertical')
+
+
+def _emit_path_elem(d_str, seg_attrs, extra_fill=None):
+    """レイアウト済み d 文字列と属性から <path> 要素を生成。"""
+    if not d_str.strip():
+        return None
+    p = ET.Element(f"{{{SVG_NS}}}path")
+    p.set('d', d_str)
+    fill = seg_attrs.get('fill') or extra_fill or '#000000'
+    p.set('fill', fill)
+    for k_svg in ('fill-opacity', 'opacity'):
+        v = seg_attrs.get(k_svg)
+        if v is not None:
+            p.set(k_svg, v)
+    p.set('stroke', 'none')
+    return p
+
+
+def _render_text_along_path(seg, svg_root):
+    """<textPath> を per-glyph でパスに沿って配置。<g> を返す。"""
+    a = seg['attrs']
+    text = _normalize_text_for_layout(seg.get('text', ''), _has_preserve_space(a))
+    text = text.replace('\n', ' ')
+    if not text.strip():
+        return None
+    path_d = seg.get('path_d')
+    if not path_d:
+        return None
+    try:
+        sampler = _PathSampler(path_d)
+    except Exception as exc:
+        print(f"[Warn] textPath sampler error: {exc}")
+        return None
+    if sampler.length <= 0:
+        return None
+
+    font_size = parse_float(a.get('font-size', 16))
+    font_family = get_safe_font_family(a.get('font-family', ''), a.get('font-weight'))
+    weight = a.get('font-weight', 'normal')
+    style = a.get('font-style', 'normal')
+    prop = _build_font_properties(font_family, weight=weight, style=style)
+    letter_spacing = _spacing_value(a.get('letter-spacing'), font_size, 0.0)
+    start = _startoffset_length(seg.get('start_offset'), sampler.length)
+
+    g = ET.Element(f"{{{SVG_NS}}}g")
+    s = start
+    parts = []
+    for ch in text:
+        if ch == '\r':
+            continue
+        adv = _raw_advance_width(ch, prop, font_size, fallback=font_size * 0.5)
+        if adv <= 0:
+            adv = font_size * 0.5
+        # サンプル位置: グリフ中心 (見た目自然)
+        sample_mid = sampler.sample(s + adv / 2.0)
+        if sample_mid is None:
+            break
+        (px, py), ang = sample_mid
+        # ベースライン開始点はサンプル中心から -adv/2 だけ接線方向に戻す
+        import math as _m
+        rad = _m.radians(ang)
+        bx = px - (adv / 2.0) * _m.cos(rad)
+        by = py - (adv / 2.0) * _m.sin(rad)
+        if ch.strip():  # 空白はスキップして進めるだけ
+            d = _glyph_path_d(ch, bx, by, font_size, prop, rotate_deg=ang)
+            if d:
+                parts.append(d)
+        s += adv + letter_spacing
+        if s > sampler.length:
+            break
+    if not parts:
+        return None
+    p = _emit_path_elem(" ".join(parts), a)
+    if p is None:
+        return None
+    g.append(p)
+    return g
+
+
+def _render_per_glyph(seg, cursor_start_x, cursor_start_y, x_arr, y_arr,
+                     dx_arr, dy_arr, rot_arr, vertical=False):
+    """rotate / x / y / dx / dy 配列 or 縦書き 用の per-glyph 配置。
+    返り値: (<path>, next_cursor_x, next_cursor_y, natural_width)
+    """
+    a = seg['attrs']
+    text = _normalize_text_for_layout(seg.get('text', ''), _has_preserve_space(a))
+    if not text:
+        return None, cursor_start_x, cursor_start_y, 0.0
+
+    font_size = parse_float(a.get('font-size', 16))
+    font_family = get_safe_font_family(a.get('font-family', ''), a.get('font-weight'))
+    weight = a.get('font-weight', 'normal')
+    style = a.get('font-style', 'normal')
+    prop = _build_font_properties(font_family, weight=weight, style=style)
+    letter_spacing = _spacing_value(a.get('letter-spacing'), font_size, 0.0)
+
+    cx, cy = cursor_start_x, cursor_start_y
+    parts = []
+    min_x, max_x = cx, cx
+    for i, ch in enumerate(text):
+        if ch in ('\r',):
+            continue
+        # x/y 配列: 該当インデックスがあれば絶対座標をセット
+        if x_arr and i < len(x_arr):
+            cx = x_arr[i]
+        if y_arr and i < len(y_arr):
+            cy = y_arr[i]
+        # dx/dy 配列
+        if dx_arr and i < len(dx_arr):
+            cx += dx_arr[i]
+        if dy_arr and i < len(dy_arr):
+            cy += dy_arr[i]
+
+        rot = 0.0
+        if rot_arr:
+            rot = rot_arr[i] if i < len(rot_arr) else rot_arr[-1]
+
+        adv = _raw_advance_width(ch, prop, font_size, fallback=font_size * 0.5)
+        if adv <= 0:
+            adv = font_size * 0.5
+
+        if ch.strip():
+            d = _glyph_path_d(ch, cx, cy, font_size, prop, rotate_deg=rot)
+            if d:
+                parts.append(d)
+        # 進行方向: 縦書きは Y、それ以外は X
+        if vertical:
+            cy += font_size + letter_spacing
+        else:
+            cx += adv + letter_spacing
+        min_x = min(min_x, cx); max_x = max(max_x, cx)
+
+    p = _emit_path_elem(" ".join(parts), a) if parts else None
+    return p, cx, cy, (max_x - cursor_start_x)
+
+
+def _needs_per_glyph(seg):
+    """このセグメントが per-glyph レンダリングを要求するか?"""
+    a = seg['attrs']
+    if 'rotate' in a:
+        vals = parse_number_list(a['rotate'])
+        if len(vals) >= 1:
+            return True
+    for k in ('x', 'y', 'dx', 'dy'):
+        if k in a:
+            vals = parse_number_list(a[k])
+            if len(vals) > 1:
+                return True
+    if _is_vertical_wm(a.get('writing-mode')):
+        return True
+    return False
+
+
+# 全体を統括する新実装 (元 convert_text_to_path_matplotlib のスーパーセット)
+def convert_text_to_path_matplotlib_v2(text_elem, svg_root):
+    if not USE_MATPLOTLIB:
+        return None
+    try:
+        segments, text_attrs = _iter_text_content(text_elem, {}, svg_root)
+        if not segments:
+            return None
+
+        # 何らかの拡張機能が絡む場合はこちらのパスで処理する。
+        has_textpath = any(s['kind'] == 'textPath' for s in segments)
+        has_advanced = any(_needs_per_glyph(s) for s in segments)
+        text_length = text_attrs.get('textLength')
+        length_adjust = (text_attrs.get('lengthAdjust') or 'spacing').strip()
+        vertical = _is_vertical_wm(text_attrs.get('writing-mode'))
+
+        # 拡張機能が不要なら従来実装にフォールバック (互換維持)
+        if not (has_textpath or has_advanced or text_length or vertical
+                or any(s['attrs'].get('baseline-shift') for s in segments)):
+            return convert_text_to_path_matplotlib_legacy(text_elem)
+
+        g = ET.Element(f"{{{SVG_NS}}}g")
+        for attr in ('transform', 'clip-path', 'mask', 'filter', 'opacity'):
+            v = text_elem.get(attr)
+            if v is not None:
+                g.set(attr, v)
+
+        cursor_x = parse_float(text_attrs.get('x', 0))
+        cursor_y = parse_float(text_attrs.get('y', 0))
+        # ネイティブ幅算出用に開始 x を保持
+        origin_x = cursor_x
+        natural_width_accum = 0.0
+
+        for seg in segments:
+            a = seg['attrs']
+            if seg['kind'] == 'textPath':
+                elem = _render_text_along_path(seg, svg_root)
+                if elem is not None:
+                    g.append(elem)
+                continue
+
+            baseline_dy = _baseline_shift_dy(a.get('baseline-shift'), parse_float(a.get('font-size', 16)))
+            local_y = cursor_y + baseline_dy
+
+            x_arr = parse_number_list(a.get('x', '')) if 'x' in a else []
+            y_arr = parse_number_list(a.get('y', '')) if 'y' in a else []
+            dx_arr = parse_number_list(a.get('dx', '')) if 'dx' in a else []
+            dy_arr = parse_number_list(a.get('dy', '')) if 'dy' in a else []
+            rot_arr = parse_number_list(a.get('rotate', '')) if 'rotate' in a else []
+
+            ex_x, ex_y = seg.get('explicit_xy', (False, False))
+            if x_arr and ex_x:
+                cursor_x = x_arr[0]
+            if y_arr and ex_y:
+                local_y = y_arr[0] + baseline_dy
+            # per-glyph に配列を渡すのは、明示的に置かれた場合のみ
+            if not ex_x:
+                x_arr = []
+            if not ex_y:
+                y_arr = []
+            if seg.get('explicit_xy', (False, False))[0] is False and dx_arr and not (len(dx_arr) > 1):
+                cursor_x += dx_arr[0]
+                dx_arr = []
+            if dy_arr and not (len(dy_arr) > 1):
+                local_y += dy_arr[0]
+                dy_arr = []
+
+            if _needs_per_glyph(seg) or vertical:
+                p, cursor_x, new_y, w = _render_per_glyph(
+                    seg, cursor_x, local_y,
+                    x_arr, y_arr, dx_arr, dy_arr, rot_arr,
+                    vertical=vertical,
+                )
+                if p is not None:
+                    g.append(p)
+                if vertical:
+                    cursor_y = new_y - baseline_dy
+                natural_width_accum += w
+            else:
+                # 単純ラン: 従来の TextPath 直接生成を使う
+                text = _normalize_text_for_layout(seg.get('text', ''), _has_preserve_space(a))
+                if not text.strip():
+                    # 空白のみでもカーソル進行
+                    font_size = parse_float(a.get('font-size', 16))
+                    font_family = get_safe_font_family(a.get('font-family', ''), a.get('font-weight'))
+                    prop = _build_font_properties(font_family)
+                    cursor_x += _raw_advance_width(text, prop, font_size,
+                                                   fallback=font_size * 0.33)
+                    continue
+                font_size = parse_float(a.get('font-size', 16))
+                font_family = get_safe_font_family(a.get('font-family', ''),
+                                                   a.get('font-weight'))
+                weight = a.get('font-weight', 'normal')
+                style = a.get('font-style', 'normal')
+                prop = _build_font_properties(font_family, weight=weight, style=style)
+                d, _bbox = _text_path_for_run(text, cursor_x, local_y,
+                                              font_size, font_family, weight, style)
+                if d.strip():
+                    p = _emit_path_elem(d, a)
+                    if p is not None:
+                        g.append(p)
+                adv = _raw_advance_width(text, prop, font_size,
+                                         fallback=font_size * 0.5)
+                cursor_x += adv
+                natural_width_accum += adv
+
+        # text-anchor 補正: g 全体を translate する (単純近似)
+        anchor = text_attrs.get('text-anchor', 'start')
+        if anchor in ('middle', 'end') and natural_width_accum > 0:
+            shift = -natural_width_accum / 2.0 if anchor == 'middle' else -natural_width_accum
+            existing = g.get('transform', '')
+            g.set('transform', (f"translate({shift:.3f},0) " + existing).strip())
+
+        # textLength / lengthAdjust=spacingAndGlyphs のスケール適用
+        if text_length is not None:
+            try:
+                target = parse_float(text_length, 0.0)
+                if target > 0 and natural_width_accum > 0 and length_adjust == 'spacingAndGlyphs':
+                    scale = target / natural_width_accum
+                    tx = origin_x
+                    existing = g.get('transform', '')
+                    g.set('transform',
+                          (f"translate({tx:.3f},0) scale({scale:.5f},1) translate({-tx:.3f},0) "
+                           + existing).strip())
+            except Exception:
+                pass
+
+        if len(g) == 0:
+            return None
+        if len(g) == 1 and not g.attrib:
+            return g[0]
+        return g
+    except Exception as e:
+        import traceback
+        print(f"[Warn] Text v2 conversion error: {e}")
+        traceback.print_exc()
+        try:
+            return convert_text_to_path_matplotlib_legacy(text_elem)
+        except Exception:
+            return None
+
+
+
+def convert_text_to_path_matplotlib(text_elem, svg_root=None):
+    """従来 API 互換: svg_root が渡された場合は v2 (textPath 等を扱う)。
+    渡されない場合は legacy 動作 (互換のため)。"""
+    if svg_root is not None:
+        return convert_text_to_path_matplotlib_v2(text_elem, svg_root)
+    return convert_text_to_path_matplotlib_legacy(text_elem)
+
 
 # ==========================================
 # 3d. SVG 共通変換パス
@@ -1289,8 +1967,11 @@ def python_pass(input_path, output_path, convert_text=True, keep_filters=True):
                     style = elem.get('style', '') or ''
                     m = re.search(r'(?:^|;)\s*fill\s*:\s*([^;]+)', style)
                     if m: fill = m.group(1).strip()
-                x = parse_float(elem.get('x', 0)); y = parse_float(elem.get('y', 0))
-                w = parse_float(elem.get('width', 0)); h = parse_float(elem.get('height', 0))
+                vp_w, vp_h = _svg_viewport_size(root)
+                x = _parse_length_percent(elem.get('x', 0), vp_w)
+                y = _parse_length_percent(elem.get('y', 0), vp_h)
+                w = _parse_length_percent(elem.get('width', 0), vp_w)
+                h = _parse_length_percent(elem.get('height', 0), vp_h)
 
                 if fill == 'url(#grid)': replace_element(parent, elem, build_grid_overlay(x, y, w, h)); continue
                 elif fill == 'url(#dots)': replace_element(parent, elem, build_dots_overlay(x, y, w, h)); continue
@@ -1344,7 +2025,13 @@ def python_pass(input_path, output_path, convert_text=True, keep_filters=True):
                 except Exception: continue
 
             elif tag == 'text' and convert_text:
-                new_elem = convert_text_to_path_matplotlib(elem)
+                # 絵文字を含む text は matplotlib では .notdef になるので
+                # <text> のまま残し、下流レンダラ (cairosvg / ブラウザ /
+                # librsvg) のフォントフォールバックに任せる。
+                if _text_element_has_emoji(elem):
+                    _augment_emoji_font_family(elem)
+                    continue
+                new_elem = convert_text_to_path_matplotlib(elem, root)
                 if new_elem is not None:
                     replace_element(parent, elem, [new_elem])
 
