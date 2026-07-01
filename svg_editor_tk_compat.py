@@ -58,6 +58,7 @@ except ImportError:
 
 SVG_NS = "http://www.w3.org/2000/svg"
 XLINK_NS = "http://www.w3.org/1999/xlink"
+XML_NS = "http://www.w3.org/XML/1998/namespace"
 ET.register_namespace('', SVG_NS)
 ET.register_namespace('xlink', XLINK_NS)
 
@@ -185,6 +186,15 @@ def parse_float(value, default=0.0):
     except Exception:
         return default
 
+def parse_number_list(value):
+    """SVG の x/y/dx/dy のような数値リストを float 配列にする。"""
+    if value is None:
+        return []
+    if isinstance(value, (int, float)):
+        return [float(value)]
+    parts = re.split(r'[\s,]+', str(value).strip())
+    return [parse_float(p) for p in parts if p]
+
 def replace_element(parent, old_elem, new_elems):
     idx = list(parent).index(old_elem)
     for offset, new_elem in enumerate(new_elems):
@@ -277,6 +287,7 @@ _PRESENTATION_PROPS = {
     'opacity', 'color', 'visibility', 'display',
     'font-family', 'font-size', 'font-weight', 'font-style', 'font-variant',
     'font-stretch', 'letter-spacing', 'word-spacing', 'text-anchor', 'dominant-baseline',
+    'white-space', 'line-height',
     'alignment-baseline', 'text-decoration', 'unicode-bidi', 'direction',
     'clip-rule', 'paint-order', 'shape-rendering', 'text-rendering',
     'vector-effect',
@@ -292,6 +303,7 @@ _INHERITED_PROPS = {
     'color',
     'font-family', 'font-size', 'font-weight', 'font-style', 'font-variant',
     'letter-spacing', 'word-spacing', 'text-anchor', 'dominant-baseline',
+    'white-space', 'line-height',
     'alignment-baseline', 'text-decoration',
     'visibility',
 }
@@ -540,6 +552,11 @@ def _text_advance_width(text, font_props, font_size):
     """Return advance width instead of ink bounding box width."""
     if not USE_MATPLOTLIB:
         return 0.0
+    # TextPath/FT2Font に改行・タブ・制御文字を直接渡すと、フォントによって
+    # .notdef の四角や謎のサブパスが混ざるため、幅計測は必ず安全な文字列で行う。
+    text = _textpath_safe_text(text)
+    if not text:
+        return 0.0
     try:
         font_path = None
         if hasattr(font_props, "get_file"):
@@ -564,6 +581,100 @@ def _text_advance_width(text, font_props, font_size):
         return float(tp.get_extents().width)
     except Exception:
         return 0.0
+
+def _textpath_safe_text(text):
+    """TextPath に渡してよい、描画可能文字だけの文字列へ変換する。"""
+    if text is None:
+        return ''
+    safe = []
+    for ch in str(text):
+        # 改行/CR/タブ/その他C0制御文字は TextPath に渡さない。
+        # 空白は advance として別処理するため、通常スペースも除外する。
+        if ch in ('\n', '\r', '\t') or (ord(ch) < 32):
+            continue
+        if ch.isspace():
+            continue
+        safe.append(ch)
+    return ''.join(safe)
+
+def _has_preserve_space(attrs):
+    """xml:space / CSS white-space から空白保持モードかを判定。"""
+    xml_space = (
+        attrs.get(f"{{{XML_NS}}}space")
+        or attrs.get('xml:space')
+        or attrs.get('space')
+    )
+    if xml_space == 'preserve':
+        return True
+    white_space = str(attrs.get('white-space', '')).strip().lower()
+    return white_space in ('pre', 'pre-wrap', 'pre-line', 'break-spaces')
+
+def _normalize_text_for_layout(text, preserve_space=False):
+    """
+    SVGテキストを TextPath に直渡しせず、自前レイアウト用に正規化する。
+    - CRLF/CR は LF に統一
+    - タブは保持モードではタブ停止、通常モードではスペース扱い
+    - ソース整形由来の前後改行・インデントは通常モードで取り除く
+    """
+    if text is None:
+        return ''
+    s = str(text).replace('\r\n', '\n').replace('\r', '\n')
+    # TextPath が苦手な制御文字は、改行/タブ以外を空文字化する。
+    s = ''.join(ch for ch in s if ch in ('\n', '\t') or ord(ch) >= 32)
+    if preserve_space:
+        return s
+
+    if '\n' in s:
+        lines = s.split('\n')
+        # <text>\n  文字\n</text> のようなSVG整形インデントを除去する。
+        while lines and not lines[0].strip(' \t'):
+            lines.pop(0)
+        while lines and not lines[-1].strip(' \t'):
+            lines.pop()
+        lines = [re.sub(r'[ \t]+', ' ', line.strip(' \t')) for line in lines]
+        return '\n'.join(lines)
+
+    return re.sub(r'[ \t]+', ' ', s.replace('\t', ' '))
+
+def _line_height_value(value, font_size):
+    """line-height をユーザー単位に変換。未指定/normal は 1.2em。"""
+    if value is None:
+        return font_size * 1.2
+    s = str(value).strip().lower()
+    if not s or s == 'normal':
+        return font_size * 1.2
+    try:
+        if s.endswith('%'):
+            return font_size * float(s[:-1]) / 100.0
+        if re.fullmatch(r'[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?', s):
+            return font_size * float(s)
+    except Exception:
+        pass
+    return parse_float(value, font_size * 1.2)
+
+def _spacing_value(value, font_size, default=0.0):
+    """letter-spacing / word-spacing 用。normal は 0。"""
+    if value is None:
+        return default
+    s = str(value).strip().lower()
+    if not s or s == 'normal':
+        return default
+    if s.endswith('em'):
+        try:
+            return float(s[:-2]) * font_size
+        except Exception:
+            return default
+    return parse_float(value, default)
+
+def _text_bbox_for_safe_text(text, font_props, font_size):
+    """安全な文字列だけで bbox を取得。空白/制御文字だけなら None。"""
+    safe = _textpath_safe_text(text)
+    if not safe:
+        return None
+    try:
+        return TextPath((0, 0), safe, size=font_size, prop=font_props).get_extents()
+    except Exception:
+        return None
 
 def get_safe_font_family(requested_family, weight=None):
     if not USE_MATPLOTLIB:
@@ -598,6 +709,105 @@ def _normalize_weight(weight_str):
     except ValueError:
         return 'normal'
 
+_FONT_WEIGHT_CACHE = {}
+def _font_file_weight_class(path):
+    """
+    resolved フォントファイルの実効 usWeightClass (100..900) を返す。
+    OS/2 テーブルが優先。無い場合は style_flags / 名前から推定。
+    判定不能なら 400 (Regular) とみなす。
+    """
+    if not path:
+        return 400
+    if path in _FONT_WEIGHT_CACHE:
+        return _FONT_WEIGHT_CACHE[path]
+    weight = None
+    try:
+        f = ft2font.FT2Font(path)
+        try:
+            os2 = f.get_sfnt_table('OS/2')
+            if os2:
+                w = int(os2.get('usWeightClass', 0) or 0)
+                if 1 <= w <= 1000:
+                    # usWeightClass 1..1000 を CSS 100..900 相当に丸める
+                    weight = max(100, min(900, int(round(w / 100.0) * 100)))
+        except Exception:
+            pass
+        if weight is None:
+            try:
+                if bool(f.style_flags & 2):  # FT_STYLE_FLAG_BOLD
+                    weight = 700
+            except Exception:
+                pass
+        if weight is None:
+            name = ((getattr(f, 'postscript_name', '') or '') + ' ' +
+                    (getattr(f, 'style_name', '') or '')).lower()
+            # 順序重要: より重いキーワードを先に見る
+            name_map = [
+                ('black', 900), ('heavy', 900), ('extrabold', 800), ('ultrabold', 800),
+                ('extra bold', 800), ('ultra bold', 800),
+                ('semibold', 600), ('demibold', 600), ('semi bold', 600), ('demi bold', 600),
+                ('bold', 700),
+                ('medium', 500),
+                ('light', 300), ('thin', 100), ('hairline', 100),
+            ]
+            for kw, w in name_map:
+                if kw in name:
+                    weight = w
+                    break
+    except Exception:
+        weight = None
+    if weight is None:
+        weight = 400
+    _FONT_WEIGHT_CACHE[path] = weight
+    return weight
+
+def _font_file_is_bold(path):
+    """後方互換: usWeightClass >= 600 を bold とみなす。"""
+    return _font_file_weight_class(path) >= 600
+
+def _requested_weight_value(weight):
+    """font-weight 属性を数値 (100..900) に正規化。既定は 400。"""
+    if weight is None:
+        return 400
+    s = str(weight).strip().lower()
+    if not s or s == 'normal':
+        return 400
+    if s == 'bold':
+        return 700
+    if s == 'bolder':
+        return 700
+    if s == 'lighter':
+        return 300
+    try:
+        w = int(float(s))
+        return max(100, min(900, w))
+    except (ValueError, TypeError):
+        return 400
+
+def _weight_requests_bold(weight):
+    return _requested_weight_value(weight) >= 600
+
+def _synthetic_bold_stroke(font_props, weight, font_size):
+    """
+    合成ボールドは廃止。
+
+    matplotlib TextPath は変数フォント / .ttc / システムのフォールバックを
+    使うと、要求 weight と実際に描画される glyph outline の太さの関係が
+    まったく予測できない (usWeightClass が 100 でも Regular ~ Bold で
+    描画されるなど)。
+
+    その状態で stroke を上乗せすると「Inkscape 版よりも明らかに太い」
+    という症状 (ユーザ報告: pure 版は太くなり過ぎ) が発生する。
+
+    リスクの低い唯一の選択肢は合成ボールドを行わないこと。matplotlib が
+    実フォントの Bold を拾えないケースでは若干細めに出るが、
+    "太すぎる" よりは "実物どおり" の方が期待に近い。
+    """
+    return 0.0
+
+
+
+
 # ==========================================
 # 3c. text → path 変換
 # ==========================================
@@ -612,10 +822,53 @@ def _get_effective_attr(elem, name, default=None):
         return sty[name]
     return default
 
-def _text_path_for_run(text_run, x, y, font_size, font_family, weight):
+def _raw_advance_width(text, font_props, font_size, fallback=None):
+    """空白も含めた advance 幅。TextPath には空白/制御文字を渡さない。"""
+    if fallback is None:
+        fallback = font_size * 0.5
+    if not text:
+        return 0.0
+    safe_raw = ''.join(ch for ch in str(text) if ord(ch) >= 32 and ch not in ('\n', '\r', '\t'))
+    if not safe_raw:
+        return 0.0
+    try:
+        font_path = None
+        if hasattr(font_props, "get_file"):
+            try:
+                font_path = font_props.get_file()
+            except Exception:
+                font_path = None
+        if not font_path:
+            font_path = findfont(font_props, fallback_to_default=True)
+        if font_path and os.path.exists(font_path):
+            font = ft2font.FT2Font(font_path)
+            font.set_size(font_size, 72)
+            font.set_text(safe_raw, 0.0)
+            width, _height = font.get_width_height()
+            if width > 0:
+                return width / 64.0
+    except Exception:
+        pass
+
+    width = 0.0
+    for ch in safe_raw:
+        if ch == ' ':
+            width += font_size * 0.33
+        elif ch == '\u3000':
+            width += font_size
+        elif ch.isspace():
+            width += font_size * 0.33
+        else:
+            width += _text_advance_width(ch, font_props, font_size) or fallback
+    return width
+
+def _text_path_for_run(text_run, x, y, font_size, font_family, weight, style=None):
     """ 1run分のテキストを path d文字列+幅 で返す """
-    prop = _build_font_properties(font_family, weight=weight)
-    tp = TextPath((0, 0), text_run, size=font_size, prop=prop)
+    safe_text = _textpath_safe_text(text_run)
+    if not safe_text:
+        return "", None
+    prop = _build_font_properties(font_family, weight=weight, style=style)
+    tp = TextPath((0, 0), safe_text, size=font_size, prop=prop)
     bbox = tp.get_extents()
 
     transform = Affine2D().scale(1, -1).translate(x, y)
@@ -647,9 +900,16 @@ def _collect_runs(text_elem, parent_attrs):
         for k in ('x', 'y', 'dx', 'dy',
                   'font-size', 'font-family', 'font-weight',
                   'font-style', 'fill', 'fill-opacity', 'opacity',
+                  'stroke', 'stroke-width', 'stroke-opacity',
+                  'stroke-linejoin', 'stroke-linecap', 'paint-order',
                   'text-anchor', 'dominant-baseline',
-                  'letter-spacing'):
+                  'letter-spacing', 'word-spacing', 'white-space', 'line-height'):
+
             v = _get_effective_attr(elem, k)
+            if v is not None:
+                a[k] = v
+        for k in (f"{{{XML_NS}}}space", 'xml:space'):
+            v = elem.get(k)
             if v is not None:
                 a[k] = v
         return a
@@ -658,7 +918,7 @@ def _collect_runs(text_elem, parent_attrs):
 
     # text 自体に直接テキストがあるか?
     direct_text = (text_elem.text or '')
-    if direct_text.strip():
+    if direct_text:
         runs.append({
             'text': direct_text,
             'attrs': text_attrs,
@@ -676,7 +936,7 @@ def _collect_runs(text_elem, parent_attrs):
                     'explicit_xy': ('x' in child.attrib, 'y' in child.attrib),
                 })
             # tspanの tail は次のテキスト
-            if child.tail and child.tail.strip():
+            if child.tail:
                 runs.append({
                     'text': child.tail,
                     'attrs': text_attrs,
@@ -701,80 +961,222 @@ def convert_text_to_path_matplotlib(text_elem):
         anchor = text_attrs.get('text-anchor', 'start')
         baseline = text_attrs.get('dominant-baseline', 'auto')
 
-        # 全体の幅を計算 (text-anchor middle/end 対応用)
-        # → まず仮レイアウト
-        total_advance = 0.0
+        # TextPath に改行/タブ/先頭空白を直渡しせず、ここでSVG風にレイアウトする。
         ymin = None
         ymax = None
-        layout = []  # (run_text, run_x, run_y, font_size, font_family, weight, fill, opacity)
+        layout = []
+        line_metrics = [{'start_x': cursor_x, 'max_x': cursor_x}]
+        current_line = 0
+        line_start_x = cursor_x
         run_cursor_x = cursor_x
         run_cursor_y = cursor_y
+
+        def ensure_line(line_index):
+            while len(line_metrics) <= line_index:
+                line_metrics.append({'start_x': cursor_x, 'max_x': cursor_x})
+
+        def update_line_width(line_index, x_end):
+            ensure_line(line_index)
+            if x_end > line_metrics[line_index]['max_x']:
+                line_metrics[line_index]['max_x'] = x_end
+
+        def append_text_segment(text_value, x, y, line_index, font_size, font_family,
+                                weight, style, fill, fill_opacity, opacity,
+                                stroke=None, stroke_width=None, stroke_opacity=None,
+                                stroke_linejoin=None, stroke_linecap=None,
+                                paint_order=None):
+            nonlocal ymin, ymax
+            safe_value = _textpath_safe_text(text_value)
+            if not safe_value:
+                return 0.0
+            prop = _build_font_properties(font_family, weight=weight, style=style)
+            bbox = _text_bbox_for_safe_text(safe_value, prop, font_size)
+            advance = _text_advance_width(safe_value, prop, font_size)
+            if advance <= 0 and bbox is not None:
+                advance = bbox.width
+            if advance <= 0:
+                return 0.0
+
+            layout.append({
+                'text': safe_value,
+                'x': x,
+                'y': y,
+                'line': line_index,
+                'font_size': font_size,
+                'font_family': font_family,
+                'weight': weight,
+                'style': style,
+                'fill': fill,
+                'fill_opacity': fill_opacity,
+                'opacity': opacity,
+                'stroke': stroke,
+                'stroke_width': stroke_width,
+                'stroke_opacity': stroke_opacity,
+                'stroke_linejoin': stroke_linejoin,
+                'stroke_linecap': stroke_linecap,
+                'paint_order': paint_order,
+                'advance': advance,
+            })
+            update_line_width(line_index, x + advance)
+            if bbox is not None:
+                if ymin is None or bbox.y0 < ymin:
+                    ymin = bbox.y0
+                if ymax is None or bbox.y1 > ymax:
+                    ymax = bbox.y1
+            return advance
+
 
         for run in runs:
             ra = run['attrs']
             font_size = parse_float(ra.get('font-size', 16))
             font_family = get_safe_font_family(ra.get('font-family', ''), ra.get('font-weight'))
             weight = ra.get('font-weight', 'normal')
-            fill = ra.get('fill')
+            style = ra.get('font-style', 'normal')
+            # PureモードでもCSS解決後の最終値（#222など）を確実に使う
+            fill = text_elem.get('fill') or ra.get('fill')
             fill_opacity = ra.get('fill-opacity')
             opacity = ra.get('opacity')
+            stroke = ra.get('stroke')
+            if stroke in ('none', ''):
+                stroke = None
+            stroke_width = ra.get('stroke-width')
+            stroke_opacity = ra.get('stroke-opacity')
+            stroke_linejoin = ra.get('stroke-linejoin')
+            stroke_linecap = ra.get('stroke-linecap')
+            paint_order = ra.get('paint-order')
+
+            preserve_space = _has_preserve_space(ra)
+            normalized_text = _normalize_text_for_layout(run['text'], preserve_space)
+            if not normalized_text:
+                continue
+            prop = _build_font_properties(font_family, weight=weight, style=style)
+            letter_spacing = _spacing_value(ra.get('letter-spacing'), font_size, 0.0)
+            word_spacing = _spacing_value(ra.get('word-spacing'), font_size, 0.0)
+            line_height = _line_height_value(ra.get('line-height'), font_size)
+            space_width = _raw_advance_width(' ', prop, font_size, fallback=font_size * 0.33)
+            if space_width <= 0:
+                space_width = font_size * 0.33
 
             # explicit な x/y があれば cursor を上書き
             ex_x, ex_y = run['explicit_xy']
             if ex_x and 'x' in ra:
-                run_cursor_x = parse_float(ra['x'])
+                x_values = parse_number_list(ra['x'])
+                if x_values:
+                    run_cursor_x = x_values[0]
+                    line_start_x = run_cursor_x
+                    ensure_line(current_line)
+                    line_metrics[current_line]['start_x'] = line_start_x
+                    line_metrics[current_line]['max_x'] = max(line_metrics[current_line]['max_x'], line_start_x)
             if ex_y and 'y' in ra:
-                run_cursor_y = parse_float(ra['y'])
+                y_values = parse_number_list(ra['y'])
+                if y_values:
+                    run_cursor_y = y_values[0]
 
             # dx, dy はオフセット
             if 'dx' in ra:
-                run_cursor_x += parse_float(ra['dx'])
+                dx_values = parse_number_list(ra['dx'])
+                if dx_values:
+                    run_cursor_x += dx_values[0]
             if 'dy' in ra:
-                run_cursor_y += parse_float(ra['dy'])
+                dy_values = parse_number_list(ra['dy'])
+                if dy_values:
+                    run_cursor_y += dy_values[0]
 
-            # 仮にこのrunの幅を計算。外接幅ではなく advance width を使う。
-            prop = _build_font_properties(font_family, weight=weight)
-            tp = TextPath((0, 0), run['text'], size=font_size, prop=prop)
-            bbox = tp.get_extents()
-            width = _text_advance_width(run['text'], prop, font_size)
-            if width <= 0:
-                width = bbox.width
+            i = 0
+            while i < len(normalized_text):
+                ch = normalized_text[i]
+                if ch == '\n':
+                    current_line += 1
+                    run_cursor_y += line_height
+                    run_cursor_x = cursor_x
+                    line_start_x = cursor_x
+                    ensure_line(current_line)
+                    line_metrics[current_line]['start_x'] = line_start_x
+                    line_metrics[current_line]['max_x'] = line_start_x
+                    i += 1
+                    continue
 
-            layout.append({
-                'text': run['text'],
-                'x': run_cursor_x,
-                'y': run_cursor_y,
-                'font_size': font_size,
-                'font_family': font_family,
-                'weight': weight,
-                'fill': fill,
-                'fill_opacity': fill_opacity,
-                'opacity': opacity,
-                'bbox': bbox,
-                'advance': width,
-            })
+                if ch == '\t':
+                    tab_width = max(space_width * 4.0, font_size)
+                    rel_x = max(0.0, run_cursor_x - line_start_x)
+                    next_tab = line_start_x + ((int(rel_x / tab_width) + 1) * tab_width)
+                    update_line_width(current_line, next_tab)
+                    run_cursor_x = next_tab
+                    i += 1
+                    continue
 
-            if ymin is None or bbox.y0 < ymin: ymin = bbox.y0
-            if ymax is None or bbox.y1 > ymax: ymax = bbox.y1
-            total_advance += width
-            run_cursor_x += width
+                if ch.isspace():
+                    j = i
+                    while j < len(normalized_text) and normalized_text[j].isspace() and normalized_text[j] not in ('\n', '\t'):
+                        j += 1
+                    spaces = normalized_text[i:j]
+                    width = sum(_raw_advance_width(c, prop, font_size, fallback=space_width) for c in spaces)
+                    width += word_spacing * len(spaces)
+                    run_cursor_x += width
+                    update_line_width(current_line, run_cursor_x)
+                    i = j
+                    continue
 
-        # text-anchor によるシフト
-        dx_anchor = 0.0
-        if anchor == 'middle':
-            dx_anchor = -total_advance / 2.0
-        elif anchor == 'end':
-            dx_anchor = -total_advance
+                if letter_spacing == 0:
+                    j = i
+                    while j < len(normalized_text) and not normalized_text[j].isspace() and normalized_text[j] not in ('\n', '\t'):
+                        j += 1
+                    segment = normalized_text[i:j]
+                else:
+                    j = i + 1
+                    segment = ch
+
+                width = append_text_segment(
+                    segment,
+                    run_cursor_x,
+                    run_cursor_y,
+                    current_line,
+                    font_size,
+                    font_family,
+                    weight,
+                    style,
+                    fill,
+                    fill_opacity,
+                    opacity,
+                    stroke=stroke,
+                    stroke_width=stroke_width,
+                    stroke_opacity=stroke_opacity,
+                    stroke_linejoin=stroke_linejoin,
+                    stroke_linecap=stroke_linecap,
+                    paint_order=paint_order,
+                )
+
+                run_cursor_x += width
+                if letter_spacing != 0 and j < len(normalized_text) and normalized_text[j] not in ('\n', '\t'):
+                    run_cursor_x += letter_spacing
+                    update_line_width(current_line, run_cursor_x)
+                i = j
+
+        # text-anchor によるシフト。複数行は各行ごとに揃える。
+        line_anchor_shift = []
+        for metric in line_metrics:
+            line_width = max(0.0, metric['max_x'] - metric['start_x'])
+            if anchor == 'middle':
+                line_anchor_shift.append(-line_width / 2.0)
+            elif anchor == 'end':
+                line_anchor_shift.append(-line_width)
+            else:
+                line_anchor_shift.append(0.0)
 
         # baseline によるシフト (text要素全体に対して)
+        # matplotlib TextPath は Y-up 座標系で bbox(ymin,ymax) を返す
+        # scale(1,-1) で Y-down に変換後: 画面上の top=y-ymax, bottom=y-ymin
         dy_baseline = 0.0
         if ymin is not None and ymax is not None:
             if baseline in ('central', 'middle'):
-                dy_baseline = -(ymin + ymax) / 2.0
+                # 中心を y 位置に合わせる
+                dy_baseline = (ymin + ymax) / 2.0
             elif baseline in ('text-after-edge', 'bottom'):
-                dy_baseline = -ymax
+                # 下端(画面上の底)を y 位置に
+                dy_baseline = ymin
             elif baseline in ('text-before-edge', 'top', 'hanging'):
-                dy_baseline = -ymin
+                # 上端(画面上の頂)を y 位置に
+                dy_baseline = ymax
 
         # 各run毎にpath要素を生成し、それを <g> にまとめる
         g_elem = ET.Element(f"{{{SVG_NS}}}g")
@@ -786,6 +1188,7 @@ def convert_text_to_path_matplotlib(text_elem):
                 g_elem.set(attr, v)
 
         for L in layout:
+            dx_anchor = line_anchor_shift[L['line']] if L['line'] < len(line_anchor_shift) else 0.0
             d_str, _ = _text_path_for_run(
                 L['text'],
                 L['x'] + dx_anchor,
@@ -793,6 +1196,7 @@ def convert_text_to_path_matplotlib(text_elem):
                 L['font_size'],
                 L['font_family'],
                 L['weight'],
+                L.get('style'),
             )
             if not d_str.strip():
                 continue
@@ -809,7 +1213,26 @@ def convert_text_to_path_matplotlib(text_elem):
                 p.set('fill-opacity', L['fill_opacity'])
             if L['opacity'] is not None and 'opacity' not in g_elem.attrib:
                 p.set('opacity', L['opacity'])
+            # 元 <text> に指定されていた stroke (例: .pseudo-bold クラス由来) は
+            # そのまま path に転写する。合成ボールドは廃止 (太くなり過ぎるため)。
+            explicit_stroke = L.get('stroke')
+            if explicit_stroke:
+                p.set('stroke', explicit_stroke)
+                if L.get('stroke_width'):
+                    p.set('stroke-width', str(L['stroke_width']))
+                if L.get('stroke_opacity'):
+                    p.set('stroke-opacity', str(L['stroke_opacity']))
+                if L.get('stroke_linejoin'):
+                    p.set('stroke-linejoin', str(L['stroke_linejoin']))
+                if L.get('stroke_linecap'):
+                    p.set('stroke-linecap', str(L['stroke_linecap']))
+                if L.get('paint_order'):
+                    p.set('paint-order', str(L['paint_order']))
+                else:
+                    p.set('paint-order', 'stroke fill')
+
             g_elem.append(p)
+
 
         if len(g_elem) == 0:
             return None
@@ -863,6 +1286,10 @@ def python_pass(input_path, output_path, convert_text=True, keep_filters=True):
 
             if tag == 'rect':
                 fill = elem.get('fill', '')
+                if not fill or 'url(' not in fill:
+                    style = elem.get('style', '') or ''
+                    m = re.search(r'(?:^|;)\s*fill\s*:\s*([^;]+)', style)
+                    if m: fill = m.group(1).strip()
                 x = parse_float(elem.get('x', 0)); y = parse_float(elem.get('y', 0))
                 w = parse_float(elem.get('width', 0)); h = parse_float(elem.get('height', 0))
 
@@ -943,12 +1370,14 @@ def inkscape_pass(input_path, output_path, inkscape_cmd):
       - Clone 解除 (unlink-clones)
       - 不要な defs の削除 (vacuum-defs)
     """
+    # 注意: object-stroke-to-path は fill=url(#gradient) と併用すると
+    # gradient fill が欠落するバグがあるため除外。stroke はそのまま残す。
+    # vacuum-defs は pattern 参照 (fill attribute のみ) を誤検知して削除する
+    # ことがあるため使用しない。パターンは事前に Python 側で実体化済み。
     actions = ";".join([
         "select-all:all",
         "unlink-clones",
-        "object-stroke-to-path",
         "object-to-path",
-        "vacuum-defs",
         f"export-filename:{output_path}",
         "export-do",
     ])
@@ -958,6 +1387,71 @@ def inkscape_pass(input_path, output_path, inkscape_cmd):
         raise RuntimeError(f"Inkscape error (code {result.returncode}): {result.stderr}")
     if not os.path.exists(output_path):
         raise RuntimeError("Inkscape did not produce an output file.")
+
+
+
+def _expand_pattern_fills(root):
+    """rect (fill=url(#grid|#dots)) を、実体の格子/ドット図形に置換する。
+    Inkscape 側で pattern 定義が失われても描画が壊れないようにする防御策。
+    style="fill:url(#..)" 形式にも対応。"""
+    _pat = re.compile(r'(?:^|;)\s*fill\s*:\s*([^;]+)')
+    for parent in list(root.iter()):
+        for elem in list(parent):
+            if get_tag_name(elem) != 'rect':
+                continue
+            fill = elem.get('fill', '') or ''
+            if 'url(' not in fill:
+                m = _pat.search(elem.get('style', '') or '')
+                if m: fill = m.group(1).strip()
+            if fill not in ('url(#grid)', 'url(#dots)'):
+                continue
+            x = parse_float(elem.get('x', 0)); y = parse_float(elem.get('y', 0))
+            w = parse_float(elem.get('width', 0)); h = parse_float(elem.get('height', 0))
+            if fill == 'url(#grid)':
+                replace_element(parent, elem, build_grid_overlay(x, y, w, h))
+            else:
+                replace_element(parent, elem, build_dots_overlay(x, y, w, h))
+
+
+def _mirror_url_paint_to_style(root):
+    """fill/stroke="url(#..)" 属性を style にも複製する。
+    Inkscape は style 側の paint を優先して保持するため、gradient 参照の
+    欠落を防げる。"""
+    for elem in root.iter():
+        for prop in ('fill', 'stroke'):
+            val = elem.get(prop, '') or ''
+            if not val.startswith('url(#'):
+                continue
+            style = elem.get('style', '') or ''
+            if re.search(rf'(?:^|;)\s*{prop}\s*:', style):
+                continue
+            style = (f'{prop}:{val};' + style).rstrip(';')
+            elem.set('style', style)
+
+
+def _fix_filter_regions(root):
+    """Inkscape によって <filter> の region が objectBoundingBox 既定
+    (x=0,y=0,width=1,height=1) に正規化されるとドロップシャドウ/グロー
+    が要素境界でクリップされるため、余裕のある region に戻す。"""
+    for elem in root.iter():
+        if get_tag_name(elem) != 'filter':
+            continue
+        # filterUnits が明示されていて userSpaceOnUse ならスキップ
+        if (elem.get('filterUnits') or 'objectBoundingBox') != 'objectBoundingBox':
+            continue
+        try:
+            fx = parse_float(elem.get('x', '0'))
+            fy = parse_float(elem.get('y', '0'))
+            fw = parse_float(elem.get('width', '1'))
+            fh = parse_float(elem.get('height', '1'))
+        except Exception:
+            continue
+        # 標的 (=クリップされる領域) は「x,y が 0 付近以上 かつ w,h が 1.05 以下」
+        if fx > -0.05 and fy > -0.05 and fw < 1.05 and fh < 1.05:
+            elem.set('x', '-0.5')
+            elem.set('y', '-0.5')
+            elem.set('width', '2')
+            elem.set('height', '2')
 
 
 def _collect_circle_specs(root):
@@ -1043,6 +1537,11 @@ def process_svg_with_inkscape(input_path, output_path, inkscape_cmd):
         tree = ET.parse(input_path)
         root = tree.getroot()
         _flatten_styles(root)
+        # Inkscape が触る前にパターン (#grid/#dots) を実体図形へ展開しておく。
+        # そうしないと Inkscape が pattern 定義を破棄して塗りが失われる。
+        _expand_pattern_fills(root)
+        # fill=url(#...) 参照を style にも複製しておくと Inkscape が保持しやすい。
+        _mirror_url_paint_to_style(root)
         circle_specs = _collect_circle_specs(root)
         tree.write(pre_tmp, encoding='utf-8', xml_declaration=True)
 
@@ -1054,6 +1553,9 @@ def process_svg_with_inkscape(input_path, output_path, inkscape_cmd):
         out_tree = ET.parse(output_path)
         out_root = out_tree.getroot()
         _restore_circles_by_id(out_root, circle_specs)
+        # Inkscape が <filter> の region を objectBoundingBox 既定 (0,0,1,1)
+        # に正規化して shadow/glow が切れる問題を復元する。
+        _fix_filter_regions(out_root)
         out_tree.write(output_path, encoding='utf-8', xml_declaration=True)
     finally:
         for p in (pre_tmp, post_tmp):
