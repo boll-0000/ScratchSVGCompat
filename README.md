@@ -4,6 +4,8 @@ ScratchでサポートされていないSVG要素を修正し、Scratch互換の
 
 Converts SVG files into a Scratch-compatible format by fixing unsupported SVG features.
 
+`pip install cairosvg Pillow matplotlib tksvg svgpathtools`
+
 ---
 
 ## 日本語
